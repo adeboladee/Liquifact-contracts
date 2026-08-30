@@ -229,11 +229,10 @@ pub struct CloseMetadata {
 
 /// Event emitted when an escrow is closed.
 #[contractevent]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CloseFinalizedEvt {
-    CloseFinalized {
-        metadata: CloseMetadata,
-    },
+pub struct CloseFinalizedEvt {
+    #[topic]
+    pub name: Symbol,
+    pub metadata: CloseMetadata,
 }
 
 /// Storage key that marks the escrow as closed (one-shot flag).
@@ -256,7 +255,10 @@ impl LiquifactEscrow {
     /// - Stores [`CloseMetadata`].
     /// - Emits a [`CloseFinalizedEvt`].
     pub fn close_escrow(env: Env) {
-        let escrow: InvoiceEscrow = env.storage().instance().get(&DataKey::Escrow)
+        let escrow: InvoiceEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow)
             .unwrap_or_else(|| panic_with_error!(&env, CloseError::NotInitialized));
         let admin = escrow.admin;
         admin.require_auth();
@@ -265,16 +267,15 @@ impl LiquifactEscrow {
             panic_with_error!(&env, CloseError::AlreadyClosed);
         }
 
-        let funding_token: Address = env.storage().instance().get(&DataKey::FundingToken)
+        let funding_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::FundingToken)
             .unwrap_or_else(|| panic_with_error!(&env, CloseError::NotInitialized));
         let token = TokenClient::new(&env, &funding_token);
         let balance = token.balance(&env.current_contract_address());
         if balance > 0 {
             panic_with_error!(&env, CloseError::ActiveBalance);
-        }
-
-        if escrow.dispute_active {
-            panic_with_error!(&env, CloseError::ActiveDispute);
         }
 
         let metadata = CloseMetadata {
@@ -283,20 +284,27 @@ impl LiquifactEscrow {
             sequence: env.ledger().sequence(),
         };
 
-        env.storage().instance().set(&Symbol::new(&env, CLOSED_KEY), &true);
-        env.storage().instance().set(&Symbol::new(&env, CLOSE_METADATA_KEY), &metadata);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, CLOSED_KEY), &true);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, CLOSE_METADATA_KEY), &metadata);
 
-        env.events().publish(CloseFinalizedEvt::CloseFinalized {
+        CloseFinalizedEvt {
+            name: symbol_short!("close"),
             metadata: metadata.clone(),
-        });
+        }
+        .publish(&env);
     }
 
     /// Returns the close metadata if the escrow has been closed.
     pub fn get_closure_metadata(env: Env) -> Option<CloseMetadata> {
-        env.storage().instance().get(&Symbol::new(&env, CLOSE_METADATA_KEY))
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, CLOSE_METADATA_KEY))
     }
 }
-
 
 /// Default maximum maturity horizon in seconds (~5 years) when no explicit horizon is configured.
 pub const DEFAULT_MATURITY_MAX_HORIZON_SECS: u64 = 157_680_000; // ~5 years (365.25 * 24 * 3600 * 5)
@@ -868,6 +876,20 @@ pub enum EscrowError {
     CallbackAfterCancellation = 244,
     /// [`LiquifactEscrow::execute_callback`] called with a nonce that has no registered callback context.
     CallbackNotFound = 245,
+    /// [`LiquifactEscrow::bind_registry_ref`] called after funding has already begun; the registry reference is immutable post-funding.
+    RegistryImmutableAfterFunding = 237,
+    /// [`LiquifactEscrow::rotate_beneficiary`] called after funding has already begun; the beneficiary is immutable post-funding.
+    BeneficiaryImmutableAfterFunding = 238,
+    /// [`LiquifactEscrow::execute_admin_recovery`] called before the recovery timelock has expired.
+    AdminRecoveryNotExpired = 239,
+
+    // --- Payer rotation errors (Issue #1207) ---
+    /// [`LiquifactEscrow::rotate_payer`] blocked while a legal hold is active.
+    LegalHoldBlocksPayerRotation = 250,
+    /// [`LiquifactEscrow::rotate_payer`] called when escrow is not open (0) or funded (1).
+    PayerRotationNotOpen = 251,
+    /// [`LiquifactEscrow::rotate_payer`] set payer to the same address as current.
+    NewPayerSameAsCurrent = 252,
 }
 
 #[inline(always)]
@@ -1043,6 +1065,7 @@ pub(crate) fn is_terminal_status(status: u32) -> bool {
 /// precondition must wrap it in
 /// `ensure(&env, is_pre_settlement_status(status), error)`.
 #[inline(always)]
+#[allow(dead_code)]
 pub(crate) fn is_pre_settlement_status(status: u32) -> bool {
     matches!(status, 0 | 1)
 }
@@ -1258,6 +1281,9 @@ pub struct InvoiceEscrow {
     pub invoice_id: Symbol,
     pub admin: Address,
     pub sme_address: Address,
+    /// The address that authorized escrow creation and must authorize funding.
+    /// Distinct from `sme_address` (beneficiary who receives payouts).
+    pub payer: Address,
     pub amount: i128,
     pub funding_target: i128,
     pub funded_amount: i128,
@@ -2188,6 +2214,17 @@ pub struct CallbackExecutedEvent {
     pub phase: u32,
 }
 
+/// Emitted by [`LiquifactEscrow::rotate_payer`] when the payer address is changed.
+#[contractevent]
+pub struct PayerRotated {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    pub prior_payer: Address,
+    pub new_payer: Address,
+}
+
 // ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
@@ -2282,10 +2319,8 @@ impl LiquifactEscrow {
             .get(&FeeScheduleStorageKey::Pending);
         if let Some(p) = pending {
             if p.activation_ledger <= current_ledger {
-                let previous: Option<FeeSchedule> = env
-                    .storage()
-                    .instance()
-                    .get(&FeeScheduleStorageKey::Active);
+                let previous: Option<FeeSchedule> =
+                    env.storage().instance().get(&FeeScheduleStorageKey::Active);
                 env.storage()
                     .instance()
                     .set(&FeeScheduleStorageKey::Active, &p);
@@ -2304,10 +2339,8 @@ impl LiquifactEscrow {
     /// Returns the active fee schedule for the current ledger, computing any
     /// not-yet-promoted boundary activation on the fly.
     pub fn get_active_fee_schedule(env: Env) -> Option<FeeSchedule> {
-        let active: Option<FeeSchedule> = env
-            .storage()
-            .instance()
-            .get(&FeeScheduleStorageKey::Active);
+        let active: Option<FeeSchedule> =
+            env.storage().instance().get(&FeeScheduleStorageKey::Active);
         let pending: Option<FeeSchedule> = env
             .storage()
             .instance()
@@ -2332,10 +2365,8 @@ impl LiquifactEscrow {
 
     /// Returns the previously active fee schedule after a boundary activation.
     pub fn get_previous_fee_schedule(env: Env) -> Option<FeeSchedule> {
-        let active: Option<FeeSchedule> = env
-            .storage()
-            .instance()
-            .get(&FeeScheduleStorageKey::Active);
+        let active: Option<FeeSchedule> =
+            env.storage().instance().get(&FeeScheduleStorageKey::Active);
         let pending: Option<FeeSchedule> = env
             .storage()
             .instance()
@@ -2742,6 +2773,7 @@ impl LiquifactEscrow {
             invoice_id: invoice_sym.clone(),
             admin: admin.clone(),
             sme_address: sme_address.clone(),
+            payer: admin.clone(),
             amount,
             funding_target: amount,
             funded_amount: 0,
@@ -3099,6 +3131,57 @@ impl LiquifactEscrow {
             prior_sme,
             new_sme: new_sme_address,
             amount: escrow.amount,
+        }
+        .publish(&env);
+
+        escrow
+    }
+
+    /// Rotate the payer address that must authorize funding.
+    ///
+    /// Permitted only before settlement (`status` 0 = open or 1 = funded) and
+    /// while no legal hold is active. Requires authorization from **both** the
+    /// current payer and the admin. A no-op rotation to the current address is rejected.
+    /// Emits [`PayerRotated`] with the prior and new addresses and returns the
+    /// updated escrow snapshot.
+    ///
+    /// # Errors
+    ///
+    /// | Condition | Typed error |
+    /// |-----------|-------------|
+    /// | Legal hold active | [`EscrowError::LegalHoldBlocksPayerRotation`] |
+    /// | Escrow not open or funded | [`EscrowError::PayerRotationNotOpen`] |
+    /// | `new_payer == current payer` | [`EscrowError::NewPayerSameAsCurrent`] |
+    pub fn rotate_payer(env: Env, new_payer: Address) -> InvoiceEscrow {
+        guard_not_legal_hold(&env, EscrowError::LegalHoldBlocksPayerRotation);
+
+        let mut escrow = Self::get_escrow(env.clone());
+
+        ensure(
+            &env,
+            escrow.status == 0 || escrow.status == 1,
+            EscrowError::PayerRotationNotOpen,
+        );
+
+        ensure(
+            &env,
+            new_payer != escrow.payer,
+            EscrowError::NewPayerSameAsCurrent,
+        );
+
+        // Dual authorization: the outgoing payer and the admin must both sign.
+        escrow.payer.require_auth();
+        escrow.admin.require_auth();
+
+        let prior_payer = escrow.payer.clone();
+        escrow.payer = new_payer.clone();
+        env.storage().instance().set(&DataKey::Escrow, &escrow);
+
+        PayerRotated {
+            name: symbol_short!("payer_rot"),
+            invoice_id: escrow.invoice_id.clone(),
+            prior_payer,
+            new_payer,
         }
         .publish(&env);
 
@@ -5531,6 +5614,7 @@ impl LiquifactEscrow {
 
         // env.clone(): env is used again after this call for storage writes and publish.
         let mut escrow = Self::get_escrow(env.clone());
+        escrow.payer.require_auth();
         // Operational pause gate (read-only), independent of the compliance legal hold below.
         guard_not_paused(&env, EscrowError::PausedBlocksFunding);
         // Legal hold check is intentionally after the escrow read: the escrow is needed for
